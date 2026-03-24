@@ -1,11 +1,34 @@
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import asyncio
 import csv
+import hashlib
+import logging
 import os
 import sqlite3
-import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+logging.basicConfig(level=logging.INFO)
+
+# =========================
+# CONFIG
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "db.sqlite3")
+CSV_PATH = os.path.join(BASE_DIR, "program.csv")
+
+
+# =========================
+# RENDER WEB STUB
+# =========================
 def run_web_server():
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -13,29 +36,16 @@ def run_web_server():
             self.end_headers()
             self.wfile.write(b"Bot is running")
 
-    port = int(os.getenv("PORT", 10000))
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            return
+
+    port = int(os.getenv("PORT", "10000"))
     server = HTTPServer(("0.0.0.0", port), Handler)
     server.serve_forever()
-
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
-
-logging.basicConfig(level=logging.INFO)
-
-# =========================
-# CONFIG
-# =========================
-import os
-BOT_TOKEN = "8522189329:AAECANmtq1bNYMHMttO7-uVWLhlKF2yEFg8"
-
-ADMIN_ID = 0  # 8522189329
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "db.sqlite3")
-CSV_PATH = os.path.join(BASE_DIR, "program.csv")
 
 
 # =========================
@@ -49,7 +59,9 @@ class UploadState(StatesGroup):
 # DB
 # =========================
 def get_conn():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db():
@@ -66,6 +78,7 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT UNIQUE NOT NULL,
             section TEXT NOT NULL,
             title TEXT NOT NULL,
             speaker TEXT,
@@ -80,7 +93,7 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS materials (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_id INTEGER NOT NULL,
+            event_key TEXT NOT NULL,
             user_id INTEGER,
             username TEXT,
             full_name TEXT,
@@ -88,8 +101,7 @@ def init_db():
             file_id TEXT NOT NULL,
             file_name TEXT,
             caption TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
-            FOREIGN KEY(event_id) REFERENCES events(id)
+            status TEXT NOT NULL DEFAULT 'pending'
         )
     """)
 
@@ -97,57 +109,69 @@ def init_db():
     conn.close()
 
 
-def clear_program_tables():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM sections")
-    cur.execute("DELETE FROM events")
-    conn.commit()
-    conn.close()
+def make_event_key(section: str, title: str, speaker: str, date: str, time_start: str, time_end: str, room: str) -> str:
+    raw = "|".join([
+        section.strip(),
+        title.strip(),
+        speaker.strip(),
+        date.strip(),
+        time_start.strip(),
+        time_end.strip(),
+        room.strip(),
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
 def import_csv():
     if not os.path.exists(CSV_PATH):
         raise FileNotFoundError(f"Не найден файл program.csv: {CSV_PATH}")
 
-    clear_program_tables()
-
     conn = get_conn()
     cur = conn.cursor()
 
-    sections = set()
+    cur.execute("DELETE FROM sections")
 
     with open(CSV_PATH, "r", encoding="utf-8-sig", newline="") as f:
-        # У тебя CSV с ;, оставляем так
-        reader = csv.DictReader(f, delimiter=';')
+        reader = csv.DictReader(f, delimiter=";")
         print("Колонки в CSV:", reader.fieldnames)
+
+        sections = set()
 
         for row in reader:
             section = (row.get("section") or "").strip()
             title = (row.get("title") or "").strip()
+            speaker = (row.get("speaker") or "").strip()
+            date = (row.get("date") or "").strip()
+            time_start = (row.get("time_start") or "").strip()
+            time_end = (row.get("time_end") or "").strip()
+            room = (row.get("room") or "").strip()
+            description = (row.get("description") or "").strip()
 
             if not section or not title:
                 continue
 
             sections.add(section)
+            event_key = make_event_key(section, title, speaker, date, time_start, time_end, room)
 
             cur.execute("""
                 INSERT INTO events (
-                    section, title, speaker, date, time_start, time_end, room, description
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    event_key, section, title, speaker, date, time_start, time_end, room, description
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_key) DO UPDATE SET
+                    section=excluded.section,
+                    title=excluded.title,
+                    speaker=excluded.speaker,
+                    date=excluded.date,
+                    time_start=excluded.time_start,
+                    time_end=excluded.time_end,
+                    room=excluded.room,
+                    description=excluded.description
             """, (
-                section,
-                title,
-                (row.get("speaker") or "").strip(),
-                (row.get("date") or "").strip(),
-                (row.get("time_start") or "").strip(),
-                (row.get("time_end") or "").strip(),
-                (row.get("room") or "").strip(),
-                (row.get("description") or "").strip(),
+                event_key, section, title, speaker, date, time_start, time_end, room, description
             ))
 
-    for section in sorted(sections):
-        cur.execute("INSERT OR IGNORE INTO sections (name) VALUES (?)", (section,))
+        for section in sorted(sections):
+            cur.execute("INSERT OR IGNORE INTO sections (name) VALUES (?)", (section,))
 
     conn.commit()
     conn.close()
@@ -183,7 +207,7 @@ def get_event(event_id: int):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, section, title, speaker, date, time_start, time_end, room, description
+        SELECT id, event_key, section, title, speaker, date, time_start, time_end, room, description
         FROM events
         WHERE id = ?
     """, (event_id,))
@@ -192,29 +216,29 @@ def get_event(event_id: int):
     return row
 
 
-def get_approved_materials(event_id: int):
+def get_approved_materials(event_key: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         SELECT id, file_type, file_id, file_name, caption
         FROM materials
-        WHERE event_id = ? AND status = 'approved'
+        WHERE event_key = ? AND status = 'approved'
         ORDER BY id
-    """, (event_id,))
+    """, (event_key,))
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def save_material(event_id: int, user: types.User, file_type: str, file_id: str, file_name: str = "", caption: str = ""):
+def save_material(event_key: str, user: types.User, file_type: str, file_id: str, file_name: str = "", caption: str = ""):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO materials (
-            event_id, user_id, username, full_name, file_type, file_id, file_name, caption, status
+            event_key, user_id, username, full_name, file_type, file_id, file_name, caption, status
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
     """, (
-        event_id,
+        event_key,
         user.id,
         user.username or "",
         user.full_name or "",
@@ -251,19 +275,21 @@ def reject_material(material_id: int):
 def sections_kb():
     builder = InlineKeyboardBuilder()
     for s in get_sections():
-        builder.button(text=s[0], callback_data=f"section:{s[0]}")
+        builder.button(text=s["name"], callback_data=f"section:{s['name']}")
     builder.adjust(1)
     return builder.as_markup()
 
 
 def events_kb(section: str):
     builder = InlineKeyboardBuilder()
-    for event_id, title, speaker, date, t1, t2, room in get_events_by_section(section):
-        time_label = f"{t1}-{t2}" if t1 or t2 else "Без времени"
-        label = f"{time_label} | {title}"
+
+    for row in get_events_by_section(section):
+        time_label = f"{row['time_start']}-{row['time_end']}" if row["time_start"] or row["time_end"] else "Без времени"
+        label = f"{time_label} | {row['title']}"
         if len(label) > 60:
             label = label[:57] + "..."
-        builder.button(text=label, callback_data=f"event:{event_id}")
+        builder.button(text=label, callback_data=f"event:{row['id']}")
+
     builder.button(text="← К разделам", callback_data="back:sections")
     builder.adjust(1)
     return builder.as_markup()
@@ -274,6 +300,7 @@ def event_kb(event_id: int, section: str):
     builder.button(text="📎 Материалы", callback_data=f"materials:{event_id}")
     builder.button(text="⬆️ Загрузить материалы", callback_data=f"upload:{event_id}")
     builder.button(text="← Назад", callback_data=f"section:{section}")
+    builder.button(text="🏠 В начало", callback_data="back:sections")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -291,7 +318,9 @@ def moderation_kb(material_id: int):
 # =========================
 async def start_handler(message: types.Message):
     await message.answer(
-        "📍 Конференция МГИ\n\nВыбери раздел программы:",
+        "📍 Конференция МГИ\n\n"
+        "Выбери раздел программы.\n\n"
+        "ℹ️ Если после паузы кнопки не отвечают — просто отправь /start",
         reply_markup=sections_kb()
     )
 
@@ -303,7 +332,8 @@ async def help_handler(message: types.Message):
         "2. Выбери раздел\n"
         "3. Выбери событие\n"
         "4. Смотри материалы или загружай свои\n\n"
-        "Форматы файлов: PDF, PPTX, DOCX, JPG, PNG"
+        "Форматы: PDF, PPTX, DOCX, JPG, PNG\n\n"
+        "Если бот молчит после паузы — отправь /start ещё раз."
     )
 
 
@@ -314,15 +344,22 @@ async def myid_handler(message: types.Message):
 async def section_handler(callback: types.CallbackQuery):
     section = callback.data.split(":", 1)[1]
 
-    await callback.message.edit_text(
-        f"📂 {section}\n\nВыбери событие:",
-        reply_markup=events_kb(section)
-    )
+    try:
+        await callback.message.edit_text(
+            f"📂 {section}\n\nВыбери событие:",
+            reply_markup=events_kb(section)
+        )
+    except Exception:
+        await callback.message.answer(
+            f"📂 {section}\n\nВыбери событие:",
+            reply_markup=events_kb(section)
+        )
+
     await callback.answer()
 
 
 async def back_sections_handler(callback: types.CallbackQuery):
-    await callback.message.edit_text(
+    await callback.message.answer(
         "📍 Выбери раздел программы:",
         reply_markup=sections_kb()
     )
@@ -337,7 +374,14 @@ async def event_handler(callback: types.CallbackQuery):
         await callback.answer("Событие не найдено", show_alert=True)
         return
 
-    _, section, title, speaker, date, t1, t2, room, description = event
+    section = event["section"]
+    title = event["title"]
+    speaker = event["speaker"]
+    date = event["date"]
+    t1 = event["time_start"]
+    t2 = event["time_end"]
+    room = event["room"]
+    description = event["description"]
 
     text = (
         f"🎤 {title}\n\n"
@@ -350,10 +394,17 @@ async def event_handler(callback: types.CallbackQuery):
     if description:
         text += f"\n{description}"
 
-    await callback.message.edit_text(
-        text,
-        reply_markup=event_kb(event_id, section)
-    )
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=event_kb(event_id, section)
+        )
+    except Exception:
+        await callback.message.answer(
+            text,
+            reply_markup=event_kb(event_id, section)
+        )
+
     await callback.answer()
 
 
@@ -365,8 +416,9 @@ async def materials_handler(callback: types.CallbackQuery):
         await callback.answer("Событие не найдено", show_alert=True)
         return
 
-    title = event[2]
-    materials = get_approved_materials(event_id)
+    title = event["title"]
+    event_key = event["event_key"]
+    materials = get_approved_materials(event_key)
 
     if not materials:
         await callback.message.answer(f"К событию «{title}» пока нет одобренных материалов.")
@@ -375,14 +427,14 @@ async def materials_handler(callback: types.CallbackQuery):
 
     await callback.message.answer(f"📎 Материалы к событию: {title}")
 
-    for _, file_type, file_id, file_name, caption in materials:
-        text_caption = caption or file_name or ""
-        if file_type == "document":
-            await callback.message.answer_document(document=file_id, caption=text_caption)
-        elif file_type == "photo":
-            await callback.message.answer_photo(photo=file_id, caption=text_caption)
+    for row in materials:
+        text_caption = row["caption"] or row["file_name"] or ""
+        if row["file_type"] == "document":
+            await callback.message.answer_document(document=row["file_id"], caption=text_caption)
+        elif row["file_type"] == "photo":
+            await callback.message.answer_photo(photo=row["file_id"], caption=text_caption)
         else:
-            await callback.message.answer_document(document=file_id, caption=text_caption)
+            await callback.message.answer_document(document=row["file_id"], caption=text_caption)
 
     await callback.answer()
 
@@ -396,11 +448,11 @@ async def upload_start_handler(callback: types.CallbackQuery, state: FSMContext)
         return
 
     await state.set_state(UploadState.waiting_for_material)
-    await state.update_data(event_id=event_id)
+    await state.update_data(event_id=event_id, event_key=event["event_key"])
 
     await callback.message.answer(
         f"⬆️ Отправь файл для события:\n\n"
-        f"{event[2]}\n\n"
+        f"{event['title']}\n\n"
         f"Поддерживается: PDF, DOCX, PPTX, JPG, PNG.\n"
         f"Можно отправить документ или фото.\n\n"
         f"Материал уйдёт на модерацию."
@@ -409,21 +461,21 @@ async def upload_start_handler(callback: types.CallbackQuery, state: FSMContext)
 
 
 async def receive_document(message: types.Message, state: FSMContext, bot: Bot):
-    current_state = await state.get_state()
-    if current_state != UploadState.waiting_for_material:
+    if await state.get_state() != UploadState.waiting_for_material:
         return
 
     data = await state.get_data()
     event_id = data.get("event_id")
+    event_key = data.get("event_key")
     event = get_event(event_id)
 
-    if not event:
+    if not event or not event_key:
         await message.answer("Событие не найдено.")
         await state.clear()
         return
 
     material_id = save_material(
-        event_id=event_id,
+        event_key=event_key,
         user=message.from_user,
         file_type="document",
         file_id=message.document.file_id,
@@ -431,7 +483,6 @@ async def receive_document(message: types.Message, state: FSMContext, bot: Bot):
         caption=message.caption or ""
     )
 
-    title = event[2]
     sender = message.from_user.full_name
     username = f"@{message.from_user.username}" if message.from_user.username else "без username"
 
@@ -441,7 +492,7 @@ async def receive_document(message: types.Message, state: FSMContext, bot: Bot):
             document=message.document.file_id,
             caption=(
                 f"Новый материал на модерацию\n\n"
-                f"Событие: {title}\n"
+                f"Событие: {event['title']}\n"
                 f"От: {sender} ({username})\n"
                 f"Файл: {message.document.file_name or 'без имени'}\n"
                 f"ID материала: {material_id}"
@@ -454,22 +505,23 @@ async def receive_document(message: types.Message, state: FSMContext, bot: Bot):
 
 
 async def receive_photo(message: types.Message, state: FSMContext, bot: Bot):
-    current_state = await state.get_state()
-    if current_state != UploadState.waiting_for_material:
+    if await state.get_state() != UploadState.waiting_for_material:
         return
 
     data = await state.get_data()
     event_id = data.get("event_id")
+    event_key = data.get("event_key")
     event = get_event(event_id)
 
-    if not event:
+    if not event or not event_key:
         await message.answer("Событие не найдено.")
         await state.clear()
         return
 
     photo = message.photo[-1]
+
     material_id = save_material(
-        event_id=event_id,
+        event_key=event_key,
         user=message.from_user,
         file_type="photo",
         file_id=photo.file_id,
@@ -477,7 +529,6 @@ async def receive_photo(message: types.Message, state: FSMContext, bot: Bot):
         caption=message.caption or ""
     )
 
-    title = event[2]
     sender = message.from_user.full_name
     username = f"@{message.from_user.username}" if message.from_user.username else "без username"
 
@@ -487,7 +538,7 @@ async def receive_photo(message: types.Message, state: FSMContext, bot: Bot):
             photo=photo.file_id,
             caption=(
                 f"Новый материал на модерацию\n\n"
-                f"Событие: {title}\n"
+                f"Событие: {event['title']}\n"
                 f"От: {sender} ({username})\n"
                 f"Файл: photo.jpg\n"
                 f"ID материала: {material_id}"
@@ -526,9 +577,14 @@ async def reject_handler(callback: types.CallbackQuery):
 # =========================
 async def main():
     print("Запуск бота...")
-    threading.Thread(target=run_web_server).start()
+
+    threading.Thread(target=run_web_server, daemon=True).start()
+
     init_db()
     import_csv()
+
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN не задан")
 
     bot = Bot(token=BOT_TOKEN)
     me = await bot.get_me()
