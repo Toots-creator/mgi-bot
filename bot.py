@@ -29,7 +29,8 @@ logging.basicConfig(level=logging.INFO)
 # CONFIG
 # =========================
 import os
-BOT_TOKEN = os.getenv("8522189329:AAECANmtq1bNYMHMttO7-uVWLhlKF2yEFg8")
+BOT_TOKEN = "8522189329:AAECANmtq1bNYMHMttO7-uVWLhlKF2yEFg8"
+
 ADMIN_ID = 0  # 8522189329
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
